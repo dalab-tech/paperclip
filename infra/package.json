@@ -1,0 +1,13 @@
+{
+  "name": "paperclip-infra",
+  "main": "index.ts",
+  "devDependencies": {
+    "@types/node": "^22"
+  },
+  "dependencies": {
+    "@pulumi/pulumi": "^3",
+    "@pulumi/gcp": "^8",
+    "@pulumi/docker": "^4",
+    "@pulumi/random": "^4"
+  }
+}

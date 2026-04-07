@@ -1,0 +1,10 @@
+name: paperclip-infra
+runtime: nodejs
+description: Multi-tenant Paperclip deployment on GCP
+config:
+  gcp:project:
+    description: GCP project ID
+  gcp:region:
+    default: us-central1
+  gcp:zone:
+    default: us-central1-a

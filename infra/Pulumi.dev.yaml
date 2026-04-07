@@ -1,0 +1,17 @@
+config:
+  gcp:project: your-gcp-project-id
+  gcp:region: us-central1
+  gcp:zone: us-central1-a
+  paperclip-infra:tenants:
+    - name: tenant-a
+      machineType: e2-small
+      diskSizeGb: 20
+      domain: tenant-a.paperclip.example.com
+    - name: tenant-b
+      machineType: e2-small
+      diskSizeGb: 20
+      domain: tenant-b.paperclip.example.com
+    - name: tenant-c
+      machineType: e2-medium
+      diskSizeGb: 50
+      domain: tenant-c.paperclip.example.com
