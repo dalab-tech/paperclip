@@ -2,6 +2,9 @@ config:
   gcp:project: your-gcp-project-id
   gcp:region: us-central1
   gcp:zone: us-central1-a
+  # Restrict SSH to your IP (recommended for production)
+  paperclip-infra:sshSourceRanges:
+    - "0.0.0.0/0"
   paperclip-infra:tenants:
     - name: tenant-a
       machineType: e2-small

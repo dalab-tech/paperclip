@@ -12,8 +12,8 @@ const gcpConfig = new pulumi.Config("gcp");
 const project = gcpConfig.require("project");
 const region = gcpConfig.get("region") || "us-central1";
 const zone = gcpConfig.get("zone") || "us-central1-a";
+const sshSourceRanges = config.getObject<string[]>("sshSourceRanges") || ["0.0.0.0/0"];
 
-// Tenant definitions — add tenants here
 const tenants: TenantConfig[] = config.requireObject("tenants");
 
 interface TenantConfig {
@@ -29,13 +29,14 @@ interface TenantConfig {
   domain?: string;
   /** Anthropic API key — stored in GCP Secret Manager */
   anthropicApiKey?: string;
+  /** OpenAI API key — stored in GCP Secret Manager */
+  openaiApiKey?: string;
 }
 
 // ---------------------------------------------------------------------------
-// Shared resources
+// Shared networking
 // ---------------------------------------------------------------------------
 
-// VPC network shared by all tenant VMs
 const network = new gcp.compute.Network("paperclip-network", {
   autoCreateSubnetworks: false,
   project,
@@ -46,15 +47,28 @@ const subnet = new gcp.compute.Subnetwork("paperclip-subnet", {
   region,
   network: network.id,
   project,
+  privateIpGoogleAccess: true, // Allow VMs to reach GCP APIs without external IP
 });
 
-// Allow HTTP/HTTPS + SSH
+// Cloud NAT for outbound internet (so VMs without public IPs can pull images, etc.)
+const router = new gcp.compute.Router("paperclip-router", {
+  network: network.id,
+  region,
+  project,
+});
+
+new gcp.compute.RouterNat("paperclip-nat", {
+  router: router.name,
+  region,
+  project,
+  natIpAllocateOption: "AUTO_ONLY",
+  sourceSubnetworkIpRangesToNat: "ALL_SUBNETWORKS_ALL_IP_RANGES",
+});
+
 const firewallHttp = new gcp.compute.Firewall("paperclip-allow-http", {
   network: network.id,
   project,
-  allows: [
-    { protocol: "tcp", ports: ["80", "443"] },
-  ],
+  allows: [{ protocol: "tcp", ports: ["80", "443"] }],
   sourceRanges: ["0.0.0.0/0"],
   targetTags: ["paperclip-server"],
 });
@@ -62,14 +76,25 @@ const firewallHttp = new gcp.compute.Firewall("paperclip-allow-http", {
 const firewallSsh = new gcp.compute.Firewall("paperclip-allow-ssh", {
   network: network.id,
   project,
-  allows: [
-    { protocol: "tcp", ports: ["22"] },
-  ],
-  sourceRanges: ["0.0.0.0/0"], // Narrow this to your IP in production
+  allows: [{ protocol: "tcp", ports: ["22"] }],
+  sourceRanges: sshSourceRanges,
   targetTags: ["paperclip-server"],
 });
 
-// Artifact Registry for Paperclip Docker image
+// Allow GCP health checks to reach VMs
+const firewallHealthCheck = new gcp.compute.Firewall("paperclip-allow-healthcheck", {
+  network: network.id,
+  project,
+  allows: [{ protocol: "tcp", ports: ["3100"] }],
+  // GCP health check probe IP ranges
+  sourceRanges: ["130.211.0.0/22", "35.191.0.0/16"],
+  targetTags: ["paperclip-server"],
+});
+
+// ---------------------------------------------------------------------------
+// Shared Artifact Registry
+// ---------------------------------------------------------------------------
+
 const registry = new gcp.artifactregistry.Repository("paperclip-registry", {
   repositoryId: "paperclip",
   format: "DOCKER",
@@ -77,27 +102,27 @@ const registry = new gcp.artifactregistry.Repository("paperclip-registry", {
   project,
 });
 
-// Service account for tenant VMs
-const vmServiceAccount = new gcp.serviceaccount.Account("paperclip-vm-sa", {
-  accountId: "paperclip-vm",
-  displayName: "Paperclip VM Service Account",
-  project,
-});
+// ---------------------------------------------------------------------------
+// Disk snapshot schedule (shared policy, applied per-tenant disk)
+// ---------------------------------------------------------------------------
 
-// Grant VM service account access to pull images from Artifact Registry
-new gcp.artifactregistry.RepositoryIamMember("paperclip-registry-reader", {
-  repository: registry.name,
-  location: region,
+const snapshotPolicy = new gcp.compute.ResourcePolicy("paperclip-snapshot-policy", {
+  name: "paperclip-daily-snapshot",
+  region,
   project,
-  role: "roles/artifactregistry.reader",
-  member: pulumi.interpolate`serviceAccount:${vmServiceAccount.email}`,
-});
-
-// Grant VM service account access to Secret Manager
-new gcp.projects.IAMMember("paperclip-vm-secret-accessor", {
-  project,
-  role: "roles/secretmanager.secretAccessor",
-  member: pulumi.interpolate`serviceAccount:${vmServiceAccount.email}`,
+  snapshotSchedulePolicy: {
+    schedule: {
+      dailySchedule: { daysInCycle: 1, startTime: "03:00" },
+    },
+    retentionPolicy: {
+      maxRetentionDays: 14,
+      onSourceDiskDelete: "KEEP_AUTO_SNAPSHOTS",
+    },
+    snapshotProperties: {
+      storageLocations: [region],
+      labels: { managed_by: "pulumi" },
+    },
+  },
 });
 
 // ---------------------------------------------------------------------------
@@ -107,20 +132,58 @@ new gcp.projects.IAMMember("paperclip-vm-secret-accessor", {
 interface TenantOutputs {
   vmIp: pulumi.Output<string>;
   bucketName: pulumi.Output<string>;
-  vmName: pulumi.Output<string>;
+  instanceGroupManager: pulumi.Output<string>;
+  domain: string;
 }
 
 const tenantOutputs: Record<string, TenantOutputs> = {};
 
 for (const tenant of tenants) {
-  const name = tenant.name;
+  const t = tenant.name;
   const machineType = tenant.machineType || "e2-small";
   const diskSizeGb = tenant.diskSizeGb || 20;
   const bucketRegion = tenant.bucketRegion || region;
+  const domain = tenant.domain || `${t}.paperclip.example.com`;
 
-  // -- GCS bucket for this tenant (backups + S3-compatible file storage) --
-  const bucket = new gcp.storage.Bucket(`${name}-bucket`, {
-    name: `paperclip-${name}-${project}`,
+  // -----------------------------------------------------------------------
+  // Per-tenant service account (isolation: each tenant VM gets its own SA)
+  // -----------------------------------------------------------------------
+
+  const sa = new gcp.serviceaccount.Account(`${t}-sa`, {
+    accountId: `paperclip-${t}`,
+    displayName: `Paperclip ${t} VM`,
+    project,
+  });
+
+  // Pull images from Artifact Registry
+  new gcp.artifactregistry.RepositoryIamMember(`${t}-registry-reader`, {
+    repository: registry.name,
+    location: region,
+    project,
+    role: "roles/artifactregistry.reader",
+    member: pulumi.interpolate`serviceAccount:${sa.email}`,
+  });
+
+  // Write logs to Cloud Logging
+  new gcp.projects.IAMMember(`${t}-log-writer`, {
+    project,
+    role: "roles/logging.logWriter",
+    member: pulumi.interpolate`serviceAccount:${sa.email}`,
+  });
+
+  // Write metrics to Cloud Monitoring
+  new gcp.projects.IAMMember(`${t}-metric-writer`, {
+    project,
+    role: "roles/monitoring.metricWriter",
+    member: pulumi.interpolate`serviceAccount:${sa.email}`,
+  });
+
+  // -----------------------------------------------------------------------
+  // GCS bucket (backups + S3-compatible file storage)
+  // -----------------------------------------------------------------------
+
+  const bucket = new gcp.storage.Bucket(`${t}-bucket`, {
+    name: `paperclip-${t}-${project}`,
     location: bucketRegion,
     project,
     uniformBucketLevelAccess: true,
@@ -128,107 +191,119 @@ for (const tenant of tenants) {
     lifecycleRules: [
       {
         action: { type: "Delete" },
-        condition: { age: 90 }, // Clean up old backup versions after 90 days
+        condition: { age: 90, withState: "ARCHIVED" },
       },
     ],
   });
 
-  // Grant VM service account write access to tenant bucket
-  new gcp.storage.BucketIAMMember(`${name}-bucket-writer`, {
+  // Only this tenant's SA can access its bucket
+  new gcp.storage.BucketIAMMember(`${t}-bucket-access`, {
     bucket: bucket.name,
     role: "roles/storage.objectAdmin",
-    member: pulumi.interpolate`serviceAccount:${vmServiceAccount.email}`,
+    member: pulumi.interpolate`serviceAccount:${sa.email}`,
   });
 
-  // -- HMAC key for S3-compatible access to GCS --
-  const hmacKey = new gcp.storage.HmacKey(`${name}-hmac`, {
-    serviceAccountEmail: vmServiceAccount.email,
+  // HMAC key for S3-compatible access
+  const hmacKey = new gcp.storage.HmacKey(`${t}-hmac`, {
+    serviceAccountEmail: sa.email,
     project,
   });
 
-  // -- Secrets in GCP Secret Manager --
-  const betterAuthSecret = new random.RandomPassword(`${name}-auth-secret`, {
+  // -----------------------------------------------------------------------
+  // Secrets — per-tenant, only accessible by tenant's SA
+  // -----------------------------------------------------------------------
+
+  const betterAuthSecret = new random.RandomPassword(`${t}-auth-secret`, {
     length: 48,
     special: false,
   });
 
-  const masterKeySecret = new random.RandomBytes(`${name}-master-key`, {
+  const masterKey = new random.RandomBytes(`${t}-master-key`, {
     length: 32,
   });
 
-  // Store Better Auth secret
-  const authSecretResource = new gcp.secretmanager.Secret(`${name}-better-auth-secret`, {
-    secretId: `paperclip-${name}-better-auth-secret`,
-    project,
-    replication: { auto: {} },
-  });
+  const secrets: Record<string, pulumi.Output<string>> = {
+    "better-auth-secret": betterAuthSecret.result,
+    "master-key": masterKey.base64,
+    "hmac-access-key-id": hmacKey.accessId,
+    "hmac-secret-key": hmacKey.secret,
+  };
 
-  new gcp.secretmanager.SecretVersion(`${name}-better-auth-secret-v1`, {
-    secret: authSecretResource.id,
-    secretData: betterAuthSecret.result,
-  });
-
-  // Store master encryption key
-  const masterKeyResource = new gcp.secretmanager.Secret(`${name}-master-key`, {
-    secretId: `paperclip-${name}-master-key`,
-    project,
-    replication: { auto: {} },
-  });
-
-  new gcp.secretmanager.SecretVersion(`${name}-master-key-v1`, {
-    secret: masterKeyResource.id,
-    secretData: masterKeySecret.base64,
-  });
-
-  // Store Anthropic API key if provided
   if (tenant.anthropicApiKey) {
-    const anthropicSecretResource = new gcp.secretmanager.Secret(`${name}-anthropic-key`, {
-      secretId: `paperclip-${name}-anthropic-key`,
+    secrets["anthropic-key"] = pulumi.output(tenant.anthropicApiKey);
+  }
+  if (tenant.openaiApiKey) {
+    secrets["openai-key"] = pulumi.output(tenant.openaiApiKey);
+  }
+
+  for (const [suffix, value] of Object.entries(secrets)) {
+    const secret = new gcp.secretmanager.Secret(`${t}-${suffix}`, {
+      secretId: `paperclip-${t}-${suffix}`,
       project,
       replication: { auto: {} },
     });
 
-    new gcp.secretmanager.SecretVersion(`${name}-anthropic-key-v1`, {
-      secret: anthropicSecretResource.id,
-      secretData: tenant.anthropicApiKey,
+    new gcp.secretmanager.SecretVersion(`${t}-${suffix}-v1`, {
+      secret: secret.id,
+      secretData: value,
+    });
+
+    // Only this tenant's SA can read its secrets
+    new gcp.secretmanager.SecretIamMember(`${t}-${suffix}-access`, {
+      secretId: secret.id,
+      project,
+      role: "roles/secretmanager.secretAccessor",
+      member: pulumi.interpolate`serviceAccount:${sa.email}`,
     });
   }
 
-  // -- Persistent disk for Paperclip data --
-  const dataDisk = new gcp.compute.Disk(`${name}-data-disk`, {
-    name: `paperclip-${name}-data`,
+  // -----------------------------------------------------------------------
+  // Persistent disk + snapshot schedule
+  // -----------------------------------------------------------------------
+
+  const dataDisk = new gcp.compute.Disk(`${t}-data-disk`, {
+    name: `paperclip-${t}-data`,
     size: diskSizeGb,
     type: "pd-balanced",
     zone,
     project,
+    resourcePolicies: [snapshotPolicy.id],
   });
 
-  // -- Static external IP --
-  const ip = new gcp.compute.Address(`${name}-ip`, {
-    name: `paperclip-${name}-ip`,
+  // -----------------------------------------------------------------------
+  // Static IP
+  // -----------------------------------------------------------------------
+
+  const ip = new gcp.compute.Address(`${t}-ip`, {
+    name: `paperclip-${t}-ip`,
     region,
     project,
   });
 
-  // -- Startup script --
+  // -----------------------------------------------------------------------
+  // Startup script
+  // -----------------------------------------------------------------------
+
   const startupScript = pulumi.interpolate`#!/bin/bash
 set -euo pipefail
+exec > >(logger -t paperclip-startup) 2>&1
 
-# Install Docker if not present
-if ! command -v docker &> /dev/null; then
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable docker
-  systemctl start docker
-fi
-
-# Install gcloud auth helper for Artifact Registry
-gcloud auth configure-docker ${region}-docker.pkg.dev --quiet
-
-# Format and mount data disk (only on first boot)
-DEVICE="/dev/disk/by-id/google-paperclip-${name}-data"
+PROJECT="${project}"
+TENANT="${t}"
+REGION="${region}"
+DOMAIN="${domain}"
+BUCKET="${bucket.name}"
+IMAGE="${region}-docker.pkg.dev/${project}/paperclip/paperclip:latest"
 MOUNT="/mnt/paperclip"
+DEVICE="/dev/disk/by-id/google-paperclip-${t}-data"
 
-if ! blkid "$DEVICE"; then
+# ---------- Helper ----------
+fetch_secret() {
+  gcloud secrets versions access latest --secret="$1" --project="$PROJECT"
+}
+
+# ---------- Data disk ----------
+if ! blkid "$DEVICE" &>/dev/null; then
   mkfs.ext4 -m 0 -F -E lazy_itable_init=0,lazy_journal_init=0 "$DEVICE"
 fi
 
@@ -236,108 +311,222 @@ mkdir -p "$MOUNT"
 if ! mountpoint -q "$MOUNT"; then
   mount -o discard,defaults "$DEVICE" "$MOUNT"
 fi
-
-# Ensure mount persists across reboots
-if ! grep -q "$MOUNT" /etc/fstab; then
+grep -q "$MOUNT" /etc/fstab || \
   echo "$DEVICE $MOUNT ext4 discard,defaults,nofail 0 2" >> /etc/fstab
-fi
 
-mkdir -p "$MOUNT/data"
+mkdir -p "$MOUNT/data" "$MOUNT/caddy-data" "$MOUNT/caddy-config"
 chown 1000:1000 "$MOUNT/data"
 
-# Fetch secrets from Secret Manager
-BETTER_AUTH_SECRET=$(gcloud secrets versions access latest --secret="paperclip-${name}-better-auth-secret" --project="${project}")
-MASTER_KEY=$(gcloud secrets versions access latest --secret="paperclip-${name}-master-key" --project="${project}")
-
-ANTHROPIC_KEY=""
-if gcloud secrets versions access latest --secret="paperclip-${name}-anthropic-key" --project="${project}" 2>/dev/null; then
-  ANTHROPIC_KEY=$(gcloud secrets versions access latest --secret="paperclip-${name}-anthropic-key" --project="${project}")
+# ---------- Install Docker (Debian) ----------
+if ! command -v docker &>/dev/null; then
+  apt-get update -qq
+  apt-get install -y -qq docker.io docker-compose-plugin cron
+  systemctl enable --now docker cron
 fi
 
-# Pull and run Paperclip
-IMAGE="${region}-docker.pkg.dev/${project}/paperclip/paperclip:latest"
+# ---------- Authenticate to Artifact Registry ----------
+gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+
+# ---------- Fetch secrets ----------
+BETTER_AUTH_SECRET=$(fetch_secret "paperclip-$TENANT-better-auth-secret")
+MASTER_KEY=$(fetch_secret "paperclip-$TENANT-master-key")
+HMAC_ACCESS_KEY=$(fetch_secret "paperclip-$TENANT-hmac-access-key-id")
+HMAC_SECRET_KEY=$(fetch_secret "paperclip-$TENANT-hmac-secret-key")
+
+ANTHROPIC_KEY=""
+ANTHROPIC_KEY=$(fetch_secret "paperclip-$TENANT-anthropic-key" 2>/dev/null) || true
+
+OPENAI_KEY=""
+OPENAI_KEY=$(fetch_secret "paperclip-$TENANT-openai-key" 2>/dev/null) || true
+
+# ---------- Caddy reverse proxy (auto TLS) ----------
+cat > "$MOUNT/Caddyfile" <<CADDY
+$DOMAIN {
+  reverse_proxy paperclip:3100
+}
+CADDY
+
+# ---------- Docker network ----------
+docker network create paperclip-net 2>/dev/null || true
+
+# ---------- Pull image ----------
 docker pull "$IMAGE" || true
 
-docker rm -f paperclip 2>/dev/null || true
+# ---------- Stop existing containers ----------
+docker rm -f paperclip caddy 2>/dev/null || true
 
+# ---------- Start Paperclip ----------
 docker run -d \
   --name paperclip \
+  --network paperclip-net \
   --restart unless-stopped \
-  -p 80:3100 \
+  --memory 1536m \
+  --cpus 1.5 \
   -v "$MOUNT/data:/paperclip" \
   -e HOST=0.0.0.0 \
   -e PORT=3100 \
   -e PAPERCLIP_HOME=/paperclip \
   -e PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   -e PAPERCLIP_DEPLOYMENT_EXPOSURE=public \
-  -e PAPERCLIP_PUBLIC_URL="https://${tenant.domain || `${name}.paperclip.example.com`}" \
+  -e PAPERCLIP_PUBLIC_URL="https://$DOMAIN" \
   -e BETTER_AUTH_SECRET="$BETTER_AUTH_SECRET" \
   -e PAPERCLIP_SECRETS_MASTER_KEY="$MASTER_KEY" \
+  -e PAPERCLIP_SECRETS_STRICT_MODE=true \
   -e PAPERCLIP_STORAGE_PROVIDER=s3 \
-  -e PAPERCLIP_STORAGE_S3_BUCKET="${bucket.name}" \
+  -e PAPERCLIP_STORAGE_S3_BUCKET="$BUCKET" \
   -e PAPERCLIP_STORAGE_S3_REGION=auto \
   -e PAPERCLIP_STORAGE_S3_ENDPOINT=https://storage.googleapis.com \
   -e PAPERCLIP_STORAGE_S3_FORCE_PATH_STYLE=true \
-  -e AWS_ACCESS_KEY_ID="${hmacKey.accessId}" \
-  -e AWS_SECRET_ACCESS_KEY="${hmacKey.secret}" \
+  -e AWS_ACCESS_KEY_ID="$HMAC_ACCESS_KEY" \
+  -e AWS_SECRET_ACCESS_KEY="$HMAC_SECRET_KEY" \
   -e PAPERCLIP_DB_BACKUP_ENABLED=true \
+  -e PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES=60 \
+  -e PAPERCLIP_DB_BACKUP_RETENTION_DAYS=30 \
   -e ANTHROPIC_API_KEY="$ANTHROPIC_KEY" \
+  -e OPENAI_API_KEY="$OPENAI_KEY" \
   "$IMAGE"
 
-# Setup backup sync cron — push SQL dumps to GCS every hour
-cat > /etc/cron.d/paperclip-backup-sync << 'CRON'
-0 * * * * root gsutil -m rsync -r /mnt/paperclip/data/instances/default/data/backups/ gs://${bucket.name}/backups/ 2>&1 | logger -t paperclip-backup
+# ---------- Start Caddy (TLS termination) ----------
+docker run -d \
+  --name caddy \
+  --network paperclip-net \
+  --restart unless-stopped \
+  -p 80:80 \
+  -p 443:443 \
+  -v "$MOUNT/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  -v "$MOUNT/caddy-data:/data" \
+  -v "$MOUNT/caddy-config:/config" \
+  caddy:2-alpine
+
+# ---------- Backup sync cron ----------
+cat > /etc/cron.d/paperclip-backup-sync <<CRON
+# Sync Paperclip SQL dumps to GCS every hour at minute 30
+30 * * * * root gsutil -m rsync -r "$MOUNT/data/instances/default/data/backups/" "gs://$BUCKET/backups/" 2>&1 | logger -t paperclip-backup
 CRON
 chmod 644 /etc/cron.d/paperclip-backup-sync
+
+echo "Paperclip startup complete for tenant $TENANT"
 `;
 
-  // -- Compute instance --
-  const vm = new gcp.compute.Instance(`${name}-vm`, {
-    name: `paperclip-${name}`,
+  // -----------------------------------------------------------------------
+  // Instance template + Managed Instance Group (auto-healing)
+  // -----------------------------------------------------------------------
+
+  const healthCheck = new gcp.compute.HealthCheck(`${t}-health-check`, {
+    name: `paperclip-${t}-hc`,
+    project,
+    checkIntervalSec: 30,
+    timeoutSec: 10,
+    healthyThreshold: 2,
+    unhealthyThreshold: 3,
+    httpHealthCheck: {
+      port: 3100,
+      requestPath: "/api/health",
+    },
+  });
+
+  const instanceTemplate = new gcp.compute.InstanceTemplate(`${t}-template`, {
+    namePrefix: `paperclip-${t}-`,
     machineType,
-    zone,
     project,
     tags: ["paperclip-server"],
 
-    bootDisk: {
-      initializeParams: {
-        image: "projects/cos-cloud/global/images/family/cos-stable",
-        size: 10,
-        type: "pd-balanced",
-      },
-    },
-
-    attachedDisks: [
+    disks: [
       {
-        source: dataDisk.selfLink,
-        deviceName: `paperclip-${name}-data`,
+        boot: true,
+        autoDelete: true,
+        sourceImage: "projects/debian-cloud/global/images/family/debian-12",
+        diskSizeGb: 10,
+        diskType: "pd-balanced",
       },
     ],
 
     networkInterfaces: [
       {
         subnetwork: subnet.id,
-        accessConfigs: [
-          { natIp: ip.address },
-        ],
+        accessConfigs: [{ natIp: ip.address }],
       },
     ],
 
     serviceAccount: {
-      email: vmServiceAccount.email,
+      email: sa.email,
       scopes: ["cloud-platform"],
     },
 
-    metadataStartupScript: startupScript,
+    metadata: {
+      "startup-script": startupScript,
+    },
 
-    // Allow stopping for updates
-    allowStoppingForUpdate: true,
+    scheduling: {
+      automaticRestart: true,
+      onHostMaintenance: "MIGRATE",
+    },
+
+    labels: {
+      tenant: t,
+      managed_by: "pulumi",
+    },
   });
 
-  tenantOutputs[name] = {
+  // MIG with size=1 gives auto-healing: if health check fails, VM is recreated
+  const mig = new gcp.compute.InstanceGroupManager(`${t}-mig`, {
+    name: `paperclip-${t}-mig`,
+    zone,
+    project,
+    baseInstanceName: `paperclip-${t}`,
+    targetSize: 1,
+
+    versions: [{ instanceTemplate: instanceTemplate.selfLinkUnique }],
+
+    autoHealingPolicies: {
+      healthCheck: healthCheck.id,
+      initialDelaySec: 300, // 5 min grace for Paperclip to start + embedded PG init
+    },
+
+    statefulDisks: [
+      {
+        deviceName: `paperclip-${t}-data`,
+        deleteRule: "NEVER",
+      },
+    ],
+
+    statefulExternalIps: [
+      {
+        interfaceName: "nic0",
+        deleteRule: "NEVER",
+      },
+    ],
+  });
+
+  // Attach the persistent disk to the MIG as a stateful per-instance config
+  new gcp.compute.PerInstanceConfig(`${t}-stateful-disk`, {
+    zone,
+    project,
+    instanceGroupManager: mig.name,
+    name: `paperclip-${t}-stateful`,
+    preservedState: {
+      disks: {
+        [`paperclip-${t}-data`]: {
+          source: dataDisk.selfLink,
+          mode: "READ_WRITE",
+        },
+      },
+      externalIps: {
+        nic0: {
+          autoDelete: "NEVER",
+          ipAddress: {
+            address: ip.selfLink,
+          },
+        },
+      },
+    },
+  });
+
+  tenantOutputs[t] = {
     vmIp: ip.address,
     bucketName: bucket.name,
-    vmName: vm.name,
+    instanceGroupManager: mig.selfLink,
+    domain,
   };
 }
 
@@ -353,7 +542,8 @@ export const tenantInfo = Object.fromEntries(
     {
       ip: out.vmIp,
       bucket: out.bucketName,
-      vm: out.vmName,
+      domain: out.domain,
+      mig: out.instanceGroupManager,
     },
   ]),
 );
