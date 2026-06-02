@@ -165,6 +165,7 @@ export type {
   WorkspaceOperation,
   WorkspaceOperationPhase,
   WorkspaceOperationStatus,
+  WorkspaceSetupStreakAlert,
 } from "./workspace-operation.js";
 export type {
   IssueWorkProduct,

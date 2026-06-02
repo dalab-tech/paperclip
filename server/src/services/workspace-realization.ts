@@ -256,6 +256,7 @@ export function buildWorkspaceRealizationRecordFromDriverInput(input: {
         branchName: null,
         worktreePath: null,
         warnings: [],
+        streakAlerts: [],
         created: false,
       },
       workspaceConfig: null,

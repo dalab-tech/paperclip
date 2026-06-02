@@ -20,6 +20,7 @@ import {
   type ModelProfileKey,
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
+  type WorkspaceSetupStreakAlert,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -655,6 +656,7 @@ export function buildRealizedExecutionWorkspaceFromPersisted(input: {
     branchName: input.workspace.branchName ?? null,
     worktreePath: strategy === "git_worktree" ? (readNonEmptyString(input.workspace.providerRef) ?? cwd) : null,
     warnings: [],
+    streakAlerts: [],
     created: false,
     baseRefSha,
   };
@@ -1732,6 +1734,26 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
     stream: "stdout" as const,
     chunk: `[paperclip] ${warning}\n`,
   };
+}
+
+export function formatWorkspaceSetupStreakAlertComment(alert: WorkspaceSetupStreakAlert): string {
+  const lines = [
+    `## Workspace Setup Alert: ${alert.streak} consecutive failures (threshold: ${alert.threshold})`,
+    "",
+    `- **Phase:** \`${alert.phase}\``,
+    `- **Workspace ID:** \`${alert.projectWorkspaceId}\``,
+    `- **Consecutive failures:** ${alert.streak} (threshold: ${alert.threshold})`,
+    `- **Last exit code:** ${alert.lastExitCode ?? "unknown"}`,
+  ];
+  if (alert.lastStderrExcerpt) {
+    lines.push("", "**Last stderr excerpt:**", "```", alert.lastStderrExcerpt.slice(0, 500), "```");
+  }
+  lines.push(
+    "",
+    "The workspace `setup_command` has failed persistently. Check the workspace configuration and setup command.",
+    "This run continues with stale workspace state (fail-open).",
+  );
+  return lines.join("\n");
 }
 
 function describeSessionResetReason(
@@ -7472,6 +7494,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
     const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
     const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
+
+    // Post board comment for any consecutive-failure streak alerts crossing the threshold.
+    if (issueId && executionWorkspace.streakAlerts.length > 0) {
+      for (const alert of executionWorkspace.streakAlerts) {
+        const alertBody = formatWorkspaceSetupStreakAlertComment(alert);
+        await issuesSvc.addComment(issueId, alertBody, { agentId: agent.id, runId: run.id }).catch(() => {});
+      }
+    }
+
     let persistedExecutionWorkspace = null;
     const nextExecutionWorkspaceMetadata = mergeExecutionWorkspaceMetadataForPersistence({
       existingMetadata: existingExecutionWorkspace?.metadata ?? null,

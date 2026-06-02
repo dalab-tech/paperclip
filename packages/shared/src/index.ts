@@ -379,6 +379,7 @@ export type {
   WorkspaceOperation,
   WorkspaceOperationPhase,
   WorkspaceOperationStatus,
+  WorkspaceSetupStreakAlert,
   WorkspaceRuntimeDesiredState,
   WorkspaceRealizationRecord,
   WorkspaceRealizationRequest,

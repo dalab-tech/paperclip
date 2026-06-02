@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   agents,
   companies,
@@ -15,6 +15,7 @@ import {
   heartbeatRuns,
   projectWorkspaces,
   projects,
+  workspaceOperations,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
@@ -41,6 +42,7 @@ import { writeLocalServiceRegistryRecord } from "../services/local-service-super
 import { resolvePaperclipConfigPath } from "../paths.ts";
 import type { WorkspaceOperation } from "@paperclipai/shared";
 import type { WorkspaceOperationRecorder } from "../services/workspace-operations.ts";
+import { countConsecutiveFailures, DEFAULT_PHASE_FAILURE_THRESHOLDS, workspaceOperationService } from "../services/workspace-operations.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -95,6 +97,7 @@ function buildWorkspace(cwd: string): RealizedExecutionWorkspace {
     branchName: null,
     worktreePath: null,
     warnings: [],
+    streakAlerts: [],
     created: false,
   };
 }
@@ -3720,5 +3723,339 @@ describeEmbeddedPostgres("runProjectWorkspaceSetupCommand (via realizeExecutionW
 
     const written = await fs.readFile(envFile, "utf8");
     expect(written).toBe(repoRoot);
+  });
+});
+
+describeEmbeddedPostgres("countConsecutiveFailures", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId!: string;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-streak-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  afterEach(async () => {
+    await db.delete(workspaceOperations);
+    await db.delete(companies);
+  });
+
+  async function insertOp(input: {
+    phase: string;
+    workspaceId: string;
+    status: "succeeded" | "failed";
+    exitCode: number;
+  }) {
+    await db.insert(workspaceOperations).values({
+      id: randomUUID(),
+      companyId,
+      phase: input.phase,
+      status: input.status,
+      exitCode: input.exitCode,
+      metadata: { workspaceId: input.workspaceId },
+      startedAt: new Date(),
+      finishedAt: new Date(),
+    });
+  }
+
+  beforeEach(async () => {
+    companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test Company",
+      issuePrefix: `TC${companyId.replace(/-/g, "").slice(0, 4).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+  });
+
+  it("returns streak 0 when no operations recorded", async () => {
+    const result = await countConsecutiveFailures(db, {
+      companyId,
+      phase: "workspace_setup",
+      projectWorkspaceId: "workspace-abc",
+    });
+    expect(result.streak).toBe(0);
+    expect(result.lastExitCode).toBeNull();
+  });
+
+  it("counts consecutive failures newest-first", async () => {
+    const wsId = randomUUID();
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "succeeded", exitCode: 0 });
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "failed", exitCode: 1 });
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "failed", exitCode: 127 });
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "failed", exitCode: 1 });
+
+    const result = await countConsecutiveFailures(db, {
+      companyId,
+      phase: "workspace_setup",
+      projectWorkspaceId: wsId,
+    });
+    expect(result.streak).toBe(3);
+    expect(result.lastExitCode).toBe(1);
+  });
+
+  it("resets streak to 0 when most recent operation is a success", async () => {
+    const wsId = randomUUID();
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "failed", exitCode: 1 });
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "failed", exitCode: 1 });
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "succeeded", exitCode: 0 });
+
+    const result = await countConsecutiveFailures(db, {
+      companyId,
+      phase: "workspace_setup",
+      projectWorkspaceId: wsId,
+    });
+    expect(result.streak).toBe(0);
+  });
+
+  it("does not count operations from a different workspace", async () => {
+    const wsA = randomUUID();
+    const wsB = randomUUID();
+    await insertOp({ phase: "workspace_setup", workspaceId: wsA, status: "failed", exitCode: 1 });
+    await insertOp({ phase: "workspace_setup", workspaceId: wsA, status: "failed", exitCode: 1 });
+    await insertOp({ phase: "workspace_setup", workspaceId: wsB, status: "failed", exitCode: 1 });
+
+    const resultA = await countConsecutiveFailures(db, {
+      companyId,
+      phase: "workspace_setup",
+      projectWorkspaceId: wsA,
+    });
+    const resultB = await countConsecutiveFailures(db, {
+      companyId,
+      phase: "workspace_setup",
+      projectWorkspaceId: wsB,
+    });
+    expect(resultA.streak).toBe(2);
+    expect(resultB.streak).toBe(1);
+  });
+
+  it("skips running operations when counting streak", async () => {
+    const wsId = randomUUID();
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "succeeded", exitCode: 0 });
+    await insertOp({ phase: "workspace_setup", workspaceId: wsId, status: "failed", exitCode: 1 });
+    // Insert a running operation which should be ignored by the query
+    await db.insert(workspaceOperations).values({
+      id: randomUUID(),
+      companyId,
+      phase: "workspace_setup",
+      status: "running",
+      exitCode: null,
+      metadata: { workspaceId: wsId },
+      startedAt: new Date(),
+    });
+
+    const result = await countConsecutiveFailures(db, {
+      companyId,
+      phase: "workspace_setup",
+      projectWorkspaceId: wsId,
+    });
+    expect(result.streak).toBe(1);
+  });
+});
+
+describeEmbeddedPostgres("streak alert propagation via realizeExecutionWorkspace", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId!: string;
+  let projectId!: string;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-streak-alert-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  afterEach(async () => {
+    await db.delete(workspaceOperations);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(companies);
+  });
+
+  async function setupCompanyAndProject() {
+    companyId = randomUUID();
+    projectId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Test Company",
+      issuePrefix: `TS${companyId.replace(/-/g, "").slice(0, 4).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Test Project",
+      status: "in_progress",
+    });
+  }
+
+  it("returns no streak alert when failures are below threshold", async () => {
+    await setupCompanyAndProject();
+    const repoRoot = await createTempRepo();
+    const workspaceId = randomUUID();
+
+    await db.insert(projectWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      name: "default",
+      sourceType: "local_path",
+      cwd: repoRoot,
+      isPrimary: false,
+      setupCommand: "exit 1",
+    });
+
+    const threshold = DEFAULT_PHASE_FAILURE_THRESHOLDS["workspace_setup"] ?? 5;
+    for (let i = 0; i < threshold - 1; i++) {
+      await realizeExecutionWorkspace({
+        db,
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId,
+          workspaceId,
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: { workspaceStrategy: { type: "git_worktree", branchTemplate: `streak-test-{{issue.identifier}}-${randomUUID().slice(0, 8)}` } },
+        issue: { id: "issue-1", identifier: "PAP-10", title: "test" },
+        agent: { id: "agent-1", name: "Test Agent", companyId },
+      });
+    }
+
+    const result = await realizeExecutionWorkspace({
+      db,
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId,
+        workspaceId,
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: `streak-test-below-${randomUUID().slice(0, 8)}` } },
+      issue: { id: "issue-1", identifier: "PAP-10", title: "test" },
+      agent: { id: "agent-1", name: "Test Agent", companyId },
+    });
+
+    expect(result.streakAlerts).toHaveLength(0);
+  });
+
+  it("emits a streak alert when failures reach the threshold", async () => {
+    await setupCompanyAndProject();
+    const repoRoot = await createTempRepo();
+    const workspaceId = randomUUID();
+
+    await db.insert(projectWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      name: "default",
+      sourceType: "local_path",
+      cwd: repoRoot,
+      isPrimary: false,
+      setupCommand: "exit 1",
+    });
+
+    const threshold = DEFAULT_PHASE_FAILURE_THRESHOLDS["workspace_setup"] ?? 5;
+    // Pre-seed (threshold - 1) failures so the final triggering run crosses the threshold.
+    for (let i = 0; i < threshold - 1; i++) {
+      await db.insert(workspaceOperations).values({
+        id: randomUUID(),
+        companyId,
+        phase: "workspace_setup",
+        status: "failed",
+        exitCode: 1,
+        metadata: { workspaceId },
+        startedAt: new Date(),
+        finishedAt: new Date(),
+      });
+    }
+
+    // Triggering run: uses a real DB-backed recorder so the failure is persisted and countable.
+    const recorder = workspaceOperationService(db).createRecorder({ companyId });
+    const result = await realizeExecutionWorkspace({
+      db,
+      recorder,
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId,
+        workspaceId,
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: `streak-alert-trigger-${randomUUID().slice(0, 8)}` } },
+      issue: { id: "issue-1", identifier: "PAP-11", title: "test" },
+      agent: { id: "agent-1", name: "Test Agent", companyId },
+    });
+
+    expect(result.streakAlerts).toHaveLength(1);
+    const alert = result.streakAlerts[0]!;
+    expect(alert.phase).toBe("workspace_setup");
+    expect(alert.projectWorkspaceId).toBe(workspaceId);
+    expect(alert.streak).toBeGreaterThanOrEqual(threshold);
+    expect(alert.threshold).toBe(threshold);
+    expect(alert.lastExitCode).not.toBe(0);
+  });
+
+  it("clears streak alert after a successful setup", async () => {
+    await setupCompanyAndProject();
+    const repoRoot = await createTempRepo();
+    const workspaceId = randomUUID();
+
+    await db.insert(projectWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      name: "default",
+      sourceType: "local_path",
+      cwd: repoRoot,
+      isPrimary: false,
+      setupCommand: "exit 0",
+    });
+
+    const threshold = DEFAULT_PHASE_FAILURE_THRESHOLDS["workspace_setup"] ?? 5;
+    // Insert enough failures via direct DB insert to exceed the threshold
+    for (let i = 0; i < threshold + 1; i++) {
+      await db.insert(workspaceOperations).values({
+        id: randomUUID(),
+        companyId,
+        phase: "workspace_setup",
+        status: "failed",
+        exitCode: 1,
+        metadata: { workspaceId },
+        startedAt: new Date(),
+        finishedAt: new Date(),
+      });
+    }
+
+    // Now run with a succeeding setup command — streak should clear
+    const result = await realizeExecutionWorkspace({
+      db,
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId,
+        workspaceId,
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: `streak-clear-${randomUUID().slice(0, 8)}` } },
+      issue: { id: "issue-1", identifier: "PAP-12", title: "test" },
+      agent: { id: "agent-1", name: "Test Agent", companyId },
+    });
+
+    // No alerts — success resets the streak
+    expect(result.streakAlerts).toHaveLength(0);
+    expect(result.warnings.some((w) => w.includes("setup command failed"))).toBe(false);
   });
 });

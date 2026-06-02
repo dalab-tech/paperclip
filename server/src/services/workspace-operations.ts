@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { workspaceOperations } from "@paperclipai/db";
 import type { WorkspaceOperation, WorkspaceOperationPhase, WorkspaceOperationStatus } from "@paperclipai/shared";
-import { asc, desc, eq, inArray, isNull, or, and } from "drizzle-orm";
+import { sql, asc, desc, eq, inArray, isNull, or, and, ne } from "drizzle-orm";
 import { notFound } from "../errors.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -259,3 +259,74 @@ export function workspaceOperationService(db: Db) {
 }
 
 export { toWorkspaceOperation };
+
+/**
+ * Per-phase consecutive-failure thresholds. When the streak for a (phase, workspace) pair
+ * reaches or exceeds the threshold, a board-visible alert is emitted.
+ * Override at runtime via PAPERCLIP_WORKSPACE_SETUP_FAILURE_THRESHOLD (applies to workspace_setup only).
+ */
+export const DEFAULT_PHASE_FAILURE_THRESHOLDS: Partial<Record<WorkspaceOperationPhase, number>> = {
+  workspace_setup: (() => {
+    const env = parseInt(process.env["PAPERCLIP_WORKSPACE_SETUP_FAILURE_THRESHOLD"] ?? "", 10);
+    return Number.isFinite(env) && env > 0 ? env : 5;
+  })(),
+};
+
+export interface ConsecutiveFailureStreak {
+  streak: number;
+  lastExitCode: number | null;
+  lastStderrExcerpt: string | null;
+}
+
+/**
+ * Counts consecutive non-zero exits for a (phase, projectWorkspaceId) pair.
+ * Walks the most recent finished operations newest-first, stopping at the first success.
+ * Stateless and idempotent — safe to call on every run.
+ */
+export async function countConsecutiveFailures(
+  db: Db,
+  input: {
+    companyId: string;
+    phase: WorkspaceOperationPhase;
+    projectWorkspaceId: string;
+    limit?: number;
+  },
+): Promise<ConsecutiveFailureStreak> {
+  const limit = input.limit ?? 20;
+  const rows = await db
+    .select({
+      exitCode: workspaceOperations.exitCode,
+      status: workspaceOperations.status,
+      stderrExcerpt: workspaceOperations.stderrExcerpt,
+    })
+    .from(workspaceOperations)
+    .where(
+      and(
+        eq(workspaceOperations.companyId, input.companyId),
+        eq(workspaceOperations.phase, input.phase),
+        sql`${workspaceOperations.metadata} ->> 'workspaceId' = ${input.projectWorkspaceId}`,
+        ne(workspaceOperations.status, "running"),
+      )!,
+    )
+    .orderBy(desc(workspaceOperations.startedAt), desc(workspaceOperations.createdAt))
+    .limit(limit);
+
+  let streak = 0;
+  let lastExitCode: number | null = null;
+  let lastStderrExcerpt: string | null = null;
+
+  for (const row of rows) {
+    const isFailure = row.status === "failed" || (row.exitCode !== null && row.exitCode !== 0);
+    if (streak === 0) {
+      lastExitCode = row.exitCode ?? null;
+      lastStderrExcerpt = row.stderrExcerpt ?? null;
+    }
+    if (isFailure) {
+      streak++;
+    } else {
+      break;
+    }
+  }
+
+  return { streak, lastExitCode, lastStderrExcerpt };
+}

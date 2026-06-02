@@ -12,6 +12,7 @@ import {
   listWorkspaceServiceCommandDefinitions,
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
+  type WorkspaceSetupStreakAlert,
 } from "@paperclipai/shared";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
@@ -27,6 +28,7 @@ import {
   writeLocalServiceRegistryRecord,
 } from "./local-service-supervisor.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
+import { countConsecutiveFailures, DEFAULT_PHASE_FAILURE_THRESHOLDS } from "./workspace-operations.js";
 import { readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 
@@ -66,6 +68,7 @@ export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   branchName: string | null;
   worktreePath: string | null;
   warnings: string[];
+  streakAlerts: WorkspaceSetupStreakAlert[];
   created: boolean;
   baseRefSha?: string | null;
 }
@@ -1094,6 +1097,11 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+interface SetupCommandResult {
+  warnings: string[];
+  streakAlert: WorkspaceSetupStreakAlert | null;
+}
+
 async function runProjectWorkspaceSetupCommand(
   db: Db | undefined,
   input: {
@@ -1107,15 +1115,15 @@ async function runProjectWorkspaceSetupCommand(
     agent: ExecutionWorkspaceAgentRef;
     recorder: WorkspaceOperationRecorder | null | undefined;
   },
-): Promise<string[]> {
-  if (!db || !input.workspaceId) return [];
+): Promise<SetupCommandResult> {
+  if (!db || !input.workspaceId) return { warnings: [], streakAlert: null };
   const [row] = await db
     .select({ setupCommand: projectWorkspaces.setupCommand })
     .from(projectWorkspaces)
     .where(eq(projectWorkspaces.id, input.workspaceId))
     .limit(1);
   const setupCommand = row?.setupCommand?.trim() ?? "";
-  if (!setupCommand) return [];
+  if (!setupCommand) return { warnings: [], streakAlert: null };
 
   try {
     await recordWorkspaceCommandOperation(input.recorder, {
@@ -1138,10 +1146,32 @@ async function runProjectWorkspaceSetupCommand(
       },
       successMessage: `Project workspace setup completed\n`,
     });
-    return [];
+    return { warnings: [], streakAlert: null };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return [`Project workspace setup command failed (run continues): ${message}`];
+    const warning = `Project workspace setup command failed (run continues): ${message}`;
+
+    // Check streak and emit alert if threshold is crossed.
+    const threshold = DEFAULT_PHASE_FAILURE_THRESHOLDS["workspace_setup"] ?? 5;
+    const streak = await countConsecutiveFailures(db, {
+      companyId: input.agent.companyId,
+      phase: "workspace_setup",
+      projectWorkspaceId: input.workspaceId,
+    }).catch(() => null);
+
+    const streakAlert: WorkspaceSetupStreakAlert | null =
+      streak && streak.streak >= threshold
+        ? {
+            phase: "workspace_setup",
+            projectWorkspaceId: input.workspaceId,
+            streak: streak.streak,
+            threshold,
+            lastExitCode: streak.lastExitCode,
+            lastStderrExcerpt: streak.lastStderrExcerpt,
+          }
+        : null;
+
+    return { warnings: [warning], streakAlert };
   }
 }
 
@@ -1163,6 +1193,7 @@ export async function realizeExecutionWorkspace(input: {
       branchName: null,
       worktreePath: null,
       warnings: [],
+      streakAlerts: [],
       created: false,
       baseRefSha: null,
     };
@@ -1191,7 +1222,7 @@ export async function realizeExecutionWorkspace(input: {
   const baseRefreshWarnings = await refreshRemoteTrackingBaseRef(repoRoot, baseRef);
   const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
 
-  const setupWarnings = await runProjectWorkspaceSetupCommand(input.db, {
+  const setupResult = await runProjectWorkspaceSetupCommand(input.db, {
     workspaceId: input.base.workspaceId,
     cwd: input.base.baseCwd,
     repoRoot,
@@ -1202,6 +1233,8 @@ export async function realizeExecutionWorkspace(input: {
     agent: input.agent,
     recorder: input.recorder,
   });
+  const setupWarnings = setupResult.warnings;
+  const setupStreakAlerts: WorkspaceSetupStreakAlert[] = setupResult.streakAlert ? [setupResult.streakAlert] : [];
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
@@ -1253,6 +1286,7 @@ export async function realizeExecutionWorkspace(input: {
       branchName,
       worktreePath: reusablePath,
       warnings: [...baseRefreshWarnings, ...setupWarnings, ...baseDrift.warnings],
+      streakAlerts: setupStreakAlerts,
       created: false,
       baseRefSha: baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
     };
@@ -1353,6 +1387,7 @@ export async function realizeExecutionWorkspace(input: {
     branchName,
     worktreePath,
     warnings: [...baseRefreshWarnings, ...setupWarnings],
+    streakAlerts: setupStreakAlerts,
     created: true,
     baseRefSha: currentBaseRefSha,
   };
@@ -1395,6 +1430,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     branchName: input.workspace.branchName ?? null,
     worktreePath: strategy === "git_worktree" ? (input.workspace.providerRef ?? cwd) : null,
     warnings: [],
+    streakAlerts: [],
     created: false,
     baseRefSha: readRecordedBaseRefSha(input.workspace.metadata),
   };
@@ -3014,6 +3050,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           branchName: row.defaultRef ?? row.repoRef ?? null,
           worktreePath: null,
           warnings: [],
+          streakAlerts: [],
           created: false,
         },
         config: {
@@ -3068,6 +3105,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           branchName: row.branchName ?? null,
           worktreePath: row.strategyType === "git_worktree" ? row.cwd : null,
           warnings: [],
+          streakAlerts: [],
           created: false,
         },
         executionWorkspaceId: row.id,

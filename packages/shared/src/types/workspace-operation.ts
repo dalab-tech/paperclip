@@ -8,6 +8,15 @@ export type WorkspaceOperationPhase =
 
 export type WorkspaceOperationStatus = "running" | "succeeded" | "failed" | "skipped";
 
+export interface WorkspaceSetupStreakAlert {
+  phase: WorkspaceOperationPhase;
+  projectWorkspaceId: string;
+  streak: number;
+  threshold: number;
+  lastExitCode: number | null;
+  lastStderrExcerpt: string | null;
+}
+
 export interface WorkspaceOperation {
   id: string;
   companyId: string;
