@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Outlet, useLocation, useNavigate, useNavigationType, useParams } from "@/lib/router";
 import { Sidebar } from "./Sidebar";
@@ -20,9 +20,8 @@ import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
 import { StandaloneBrowserControls } from "./StandaloneBrowserControls";
 import { RouteErrorBoundary } from "./RouteErrorBoundary";
-import { SidebarShell } from "./SidebarShell";
-import { SecondarySidebar } from "./SecondarySidebar";
 import { SidebarAccountMenu } from "./SidebarAccountMenu";
+import { ApplicationShell } from "./ApplicationShell";
 import { useDialogActions } from "../context/DialogContext";
 import { GeneralSettingsProvider } from "../context/GeneralSettingsContext";
 import { usePanel } from "../context/PanelContext";
@@ -43,8 +42,6 @@ import {
 } from "../lib/navigation-scroll";
 import { queryKeys } from "../lib/queryKeys";
 import { scheduleMainContentFocus } from "../lib/main-content-focus";
-import { pinDocumentScrollToZero } from "../lib/pin-document-scroll";
-import { cn } from "../lib/utils";
 import { NotFoundPage } from "../pages/NotFound";
 import { PluginSlotMount, resolveRouteSidebarSlot, usePluginSlots } from "../plugins/slots";
 
@@ -83,15 +80,9 @@ function isSkillsStoreRoute(pathname: string, companyPrefix: string | undefined)
 
 export function Layout() {
   const {
-    sidebarOpen,
-    setSidebarOpen,
     toggleSidebar,
     toggleCollapsed,
-    collapsed,
-    peeking,
-    setPeeking,
     isMobile,
-    setForceCollapsed,
   } = useSidebar();
   const { openNewIssue, openOnboarding } = useDialogActions();
   const { togglePanelVisible } = usePanel();
@@ -133,12 +124,10 @@ export function Layout() {
   // app nav collapses to its rail throughout the Skills Store section (PAP-10879).
   const isSkillsRoute = isSkillsStoreRoute(location.pathname, companyPrefix);
   const onboardingTriggered = useRef(false);
-  const lastMainScrollTop = useRef(0);
   const previousPathname = useRef<string | null>(null);
   const mainContentRef = useRef<HTMLElement | null>(null);
   const scrollMemory = useRef(new NavigationScrollMemory());
   const activeScrollKey = useRef<string>(location.key);
-  const [mobileNavVisible, setMobileNavVisible] = useState(true);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const matchedCompany = useMemo(() => {
     if (!companyPrefix) return null;
@@ -189,7 +178,6 @@ export function Layout() {
       missingBehavior="placeholder"
     />
   ) : null;
-  const hasSecondarySidebar = secondarySidebar != null;
   const { data: health } = useQuery({
     queryKey: queryKeys.health,
     queryFn: () => healthApi.get(),
@@ -204,17 +192,6 @@ export function Layout() {
     queryKey: queryKeys.instance.generalSettings,
     queryFn: () => instanceSettingsApi.getGeneral(),
   }).data?.keyboardShortcuts === true;
-
-  // A secondary sidebar always collapses the app sidebar to its rail (still
-  // peek-able) — a hard invariant that overrides the user pin while the route
-  // is active, but does NOT mutate the persisted preference. Clearing the force
-  // on cleanup restores the user's expanded/collapsed choice when navigating
-  // off the takeover route (PAP-10694).
-  const forceRailCollapsed = hasSecondarySidebar || isSkillsRoute;
-  useLayoutEffect(() => {
-    setForceCollapsed(forceRailCollapsed);
-    return () => setForceCollapsed(false);
-  }, [forceRailCollapsed, setForceCollapsed]);
 
   useEffect(() => {
     if (companiesLoading || onboardingTriggered.current) return;
@@ -310,102 +287,6 @@ export function Layout() {
     }));
   }, []);
 
-  // Peek (hover flyout) triggers for the collapsed rail. Opening has a tiny
-  // delay so a pointer merely sweeping across the rail doesn't flash it open;
-  // closing is debounced to avoid flicker on the rail→overlay seam. Keyboard
-  // focus opens immediately so tabbing reaches the full nav. Context gates the
-  // effective `peeking` to desktop + collapsed + hover-capable pointers, so
-  // these handlers are inert otherwise.
-  const peekTimer = useRef<number | null>(null);
-  // Whether the pointer is currently over the peek panel. Used to keep the peek
-  // open across focus changes (e.g. navigation steals focus to <main>) as long as
-  // the user is still hovering — it should only close when they actually mouse off
-  // (PAP-10676).
-  const pointerInsidePanel = useRef(false);
-  // When the user explicitly collapses while the pointer is still over the panel,
-  // suppress re-peeking until the pointer actually leaves — otherwise the lingering
-  // hover immediately re-expands the rail and the collapse "doesn't take" until the
-  // mouse moves away (PAP-10676). Re-armed on the next genuine pointer-leave.
-  const suppressPeekRef = useRef(false);
-  const clearPeekTimer = useCallback(() => {
-    if (peekTimer.current !== null) {
-      window.clearTimeout(peekTimer.current);
-      peekTimer.current = null;
-    }
-  }, []);
-  const openPeek = useCallback(() => {
-    clearPeekTimer();
-    peekTimer.current = window.setTimeout(() => setPeeking(true), 50);
-  }, [clearPeekTimer, setPeeking]);
-  const openPeekImmediate = useCallback(() => {
-    clearPeekTimer();
-    setPeeking(true);
-  }, [clearPeekTimer, setPeeking]);
-  const closePeek = useCallback(() => {
-    clearPeekTimer();
-    peekTimer.current = window.setTimeout(() => setPeeking(false), 120);
-  }, [clearPeekTimer, setPeeking]);
-  // Tracked even while expanded so that, at the moment of collapse, we know
-  // whether the pointer is over the panel and should suppress the re-peek.
-  const handlePanelPointerEnter = useCallback(() => {
-    pointerInsidePanel.current = true;
-    if (collapsed && !suppressPeekRef.current) openPeek();
-  }, [collapsed, openPeek]);
-  const handlePanelPointerLeave = useCallback(() => {
-    pointerInsidePanel.current = false;
-    suppressPeekRef.current = false; // pointer left — re-arm peek for the next hover
-    closePeek();
-  }, [closePeek]);
-  const handlePanelFocus = useCallback(() => {
-    if (suppressPeekRef.current) return;
-    openPeekImmediate();
-  }, [openPeekImmediate]);
-  // Close on focus leaving the panel only when the pointer isn't hovering it.
-  // Clicking a rail/peek nav item moves focus to <main> on navigation; if the
-  // mouse is still over the flyout we keep it open until the pointer leaves.
-  const handlePanelBlur = useCallback(() => {
-    if (pointerInsidePanel.current) return;
-    closePeek();
-  }, [closePeek]);
-
-  // Tidy up any pending peek timer on unmount.
-  useEffect(() => clearPeekTimer, [clearPeekTimer]);
-
-  // An explicit collapse must be atomic: cancel any in-flight/active peek, and if
-  // the pointer is still over the panel suppress re-peeking until it leaves, so the
-  // rail doesn't immediately re-expand under the lingering hover (PAP-10676).
-  const wasCollapsed = useRef(collapsed);
-  useEffect(() => {
-    if (collapsed !== wasCollapsed.current) {
-      if (collapsed) {
-        clearPeekTimer();
-        setPeeking(false);
-        suppressPeekRef.current = pointerInsidePanel.current;
-      } else {
-        suppressPeekRef.current = false;
-      }
-      wasCollapsed.current = collapsed;
-    }
-  }, [collapsed, clearPeekTimer, setPeeking]);
-
-  // Intentionally do NOT close the peek on navigation: clicking a nav item means
-  // the pointer is still over the flyout, so it should stay open until the user
-  // actually mouses off (handled by onPanelMouseLeave) or blurs out / hits Escape
-  // (PAP-10676). Auto-closing here made the sidebar collapse on every page change.
-
-  // Escape closes an open peek without trapping the pointer.
-  useEffect(() => {
-    if (!peeking) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        clearPeekTimer();
-        setPeeking(false);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [peeking, clearPeekTimer, setPeeking]);
-
   useCompanyPageMemory();
 
   useKeyboardShortcuts({
@@ -418,114 +299,6 @@ export function Layout() {
     onShowShortcuts: () => setShortcutsOpen(true),
     onGoToInbox: () => navigate("/inbox"),
   });
-
-  useEffect(() => {
-    if (!isMobile) {
-      setMobileNavVisible(true);
-      return;
-    }
-    lastMainScrollTop.current = 0;
-    setMobileNavVisible(true);
-  }, [isMobile]);
-
-  // Swipe gesture to open/close sidebar on mobile
-  useEffect(() => {
-    if (!isMobile) return;
-
-    const EDGE_ZONE = 30; // px from left edge to start open-swipe
-    const MIN_DISTANCE = 50; // minimum horizontal swipe distance
-    const MAX_VERTICAL = 75; // max vertical drift before we ignore
-
-    let startX = 0;
-    let startY = 0;
-
-    const onTouchStart = (e: TouchEvent) => {
-      const t = e.touches[0]!;
-      startX = t.clientX;
-      startY = t.clientY;
-    };
-
-    const onTouchEnd = (e: TouchEvent) => {
-      const t = e.changedTouches[0]!;
-      const dx = t.clientX - startX;
-      const dy = Math.abs(t.clientY - startY);
-
-      if (dy > MAX_VERTICAL) return; // vertical scroll, ignore
-
-      // Swipe right from left edge → open
-      if (!sidebarOpen && startX < EDGE_ZONE && dx > MIN_DISTANCE) {
-        setSidebarOpen(true);
-        return;
-      }
-
-      // Swipe left when open → close
-      if (sidebarOpen && dx < -MIN_DISTANCE) {
-        setSidebarOpen(false);
-      }
-    };
-
-    document.addEventListener("touchstart", onTouchStart, { passive: true });
-    document.addEventListener("touchend", onTouchEnd, { passive: true });
-
-    return () => {
-      document.removeEventListener("touchstart", onTouchStart);
-      document.removeEventListener("touchend", onTouchEnd);
-    };
-  }, [isMobile, sidebarOpen, setSidebarOpen]);
-
-  const updateMobileNavVisibility = useCallback((currentTop: number) => {
-    const delta = currentTop - lastMainScrollTop.current;
-
-    if (currentTop <= 24) {
-      setMobileNavVisible(true);
-    } else if (delta > 8) {
-      setMobileNavVisible(false);
-    } else if (delta < -8) {
-      setMobileNavVisible(true);
-    }
-
-    lastMainScrollTop.current = currentTop;
-  }, []);
-
-  useEffect(() => {
-    if (!isMobile) {
-      setMobileNavVisible(true);
-      lastMainScrollTop.current = 0;
-      return;
-    }
-
-    const onScroll = () => {
-      updateMobileNavVisibility(window.scrollY || document.documentElement.scrollTop || 0);
-    };
-
-    onScroll();
-    window.addEventListener("scroll", onScroll, { passive: true });
-
-    return () => {
-      window.removeEventListener("scroll", onScroll);
-    };
-  }, [isMobile, updateMobileNavVisibility]);
-
-  useEffect(() => {
-    const previousOverflow = document.body.style.overflow;
-
-    document.body.style.overflow = isMobile ? "visible" : "clip";
-
-    return () => {
-      document.body.style.overflow = previousOverflow;
-    };
-  }, [isMobile]);
-
-  // `scrollIntoView` walks every ancestor scroll container. On a long thread
-  // the post-submit `scrollIntoView` on the new comment reaches `<html>` and
-  // animates `documentElement.scrollTop` via the browser's internal scroll
-  // algorithm, which bypasses the CSS `overflow` on the root element and
-  // visually shifts the entire shell (sidebar included) off-screen. Pin
-  // both roots to scrollTop=0 on every scroll tick.
-  useEffect(() => {
-    if (isMobile) return;
-    return pinDocumentScrollToZero();
-  }, [isMobile]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -575,145 +348,58 @@ export function Layout() {
 
   return (
     <GeneralSettingsProvider value={{ keyboardShortcutsEnabled }}>
-      <div
-      className={cn(
-        "bg-background text-foreground pt-(--sz-safe-top)",
-        // overflow-x-clip on mobile keeps a stray wide descendant from making the
-        // whole viewport scroll horizontally. clip (not hidden) leaves overflow-y
-        // computed as visible, so native body scroll + the sticky breadcrumb keep
-        // working.
-        isMobile ? "min-h-dvh overflow-x-clip" : "flex h-dvh flex-col overflow-clip",
-      )}
-      >
-      <a
-        href="#main-content"
-        className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-(--z-200) focus:rounded-md focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:shadow-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        Skip to Main Content
-      </a>
-      <WorktreeBanner />
-      <DevRestartBanner devServer={health?.devServer} />
-      <div className={cn("min-h-0 flex-1", isMobile ? "w-full" : "flex overflow-clip")}>
-        {isMobile && sidebarOpen && (
-          <button
-            type="button"
-            className="fixed inset-0 z-40 bg-black/50"
-            onClick={() => setSidebarOpen(false)}
-            aria-label="Close sidebar"
-          />
-        )}
-
-        {isMobile ? (
-          <div
-            className={cn(
-              "fixed inset-y-0 left-0 z-50 flex flex-col overflow-hidden pt-(--sz-safe-top) transition-transform duration-100 ease-out",
-              sidebarOpen ? "translate-x-0" : "-translate-x-full"
-            )}
-          >
-            <div className="flex flex-1 min-h-0 overflow-hidden">
-              <div className="w-60 shrink-0 overflow-hidden">
-                {hasSecondarySidebar ? secondarySidebar : <Sidebar />}
-              </div>
-            </div>
+      <>
+        <ApplicationShell
+          primarySidebar={<Sidebar />}
+          primarySidebarFooter={
             <SidebarAccountMenu
               deploymentMode={health?.deploymentMode}
               serverGit={health?.serverInfo?.git}
               version={health?.version}
             />
-          </div>
-        ) : (
-          <SidebarShell
-            open={sidebarOpen}
-            collapsed={collapsed}
-            peeking={peeking}
-            resizable
-            onPanelMouseEnter={handlePanelPointerEnter}
-            onPanelMouseLeave={handlePanelPointerLeave}
-            onPanelFocusCapture={collapsed ? handlePanelFocus : undefined}
-            onPanelBlurCapture={collapsed ? handlePanelBlur : undefined}
-          >
-            <div className="flex flex-1 min-h-0">
-              <Sidebar />
-            </div>
-            <SidebarAccountMenu
-              deploymentMode={health?.deploymentMode}
-              serverGit={health?.serverInfo?.git}
-              version={health?.version}
+          }
+          secondarySidebar={secondarySidebar}
+          forcePrimarySidebarCollapsed={isSkillsRoute}
+          banners={
+            <>
+              <WorktreeBanner />
+              <DevRestartBanner devServer={health?.devServer} />
+            </>
+          }
+          header={
+            <>
+              <StandaloneBrowserControls mobile={isMobile} />
+              <BreadcrumbBar />
+              {isMobile && isCompanySettingsRoute ? (
+                <div className="border-b border-border px-4 pb-3">
+                  <CompanySettingsNav />
+                </div>
+              ) : null}
+            </>
+          }
+          trailingPane={<PropertiesPanel />}
+          mobileNavigation={(visible) => <MobileBottomNav visible={visible} />}
+          mainRef={mainContentRef}
+        >
+          {hasUnknownCompanyPrefix ? (
+            <NotFoundPage
+              scope="invalid_company_prefix"
+              requestedPrefix={companyPrefix ?? selectedCompany?.issuePrefix}
             />
-          </SidebarShell>
-        )}
-
-        {!isMobile && hasSecondarySidebar ? (
-          <SecondarySidebar>{secondarySidebar}</SecondarySidebar>
-        ) : null}
-
-        <div className={cn("flex min-w-0 flex-col", isMobile ? "w-full" : "h-full flex-1")}>
-          <div
-            className={cn(
-              isMobile && "sticky top-0 z-20 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/85",
-            )}
-          >
-            <StandaloneBrowserControls mobile={isMobile} />
-            <BreadcrumbBar />
-            {isMobile && isCompanySettingsRoute ? (
-              <div className="border-b border-border px-4 pb-3">
-                <CompanySettingsNav />
-              </div>
-            ) : null}
-          </div>
-          <div className={cn(isMobile ? "block" : "flex flex-1 min-h-0")}>
-            <main
-              id="main-content"
-              ref={mainContentRef}
-              tabIndex={-1}
-              // Publish the pinned-composer bottom offset to descendants
-              // (PAP-495): while the auto-hiding mobile nav is on screen, raise
-              // it to the nav height so a sticky composer clears the nav; drop
-              // it back to the safe-area dock when the nav hides. Desktop leaves
-              // the token at its :root default.
-              style={
-                isMobile
-                  ? ({
-                      "--tc-composer-bottom": mobileNavVisible
-                        ? "var(--sz-calc-14)"
-                        : "var(--sz-calc-8)",
-                    } as CSSProperties)
-                  : undefined
-              }
-              className={cn(
-                "flex-1 p-4 outline-none md:p-6",
-                // Reserve the scrollbar gutter on desktop so pages whose height
-                // changes (e.g. switching skill-detail tabs) don't widen/shift
-                // when the vertical scrollbar appears or disappears (PAP-10907).
-                isMobile
-                  ? "overflow-visible pb-(--sz-calc-14)"
-                  : "overflow-auto [scrollbar-gutter:stable]",
-              )}
-            >
-              {hasUnknownCompanyPrefix ? (
-                <NotFoundPage
-                  scope="invalid_company_prefix"
-                  requestedPrefix={companyPrefix ?? selectedCompany?.issuePrefix}
-                />
-              ) : (
-                <RouteErrorBoundary>
-                  <Outlet />
-                </RouteErrorBoundary>
-              )}
-            </main>
-            <PropertiesPanel />
-          </div>
-        </div>
-      </div>
-      {isMobile && <MobileBottomNav visible={mobileNavVisible} />}
-      <CommandPalette />
-      <NewIssueDialog />
-      <NewProjectDialog />
-      <NewGoalDialog />
-      <NewAgentDialog />
-      <KeyboardShortcutsCheatsheet open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
-      <ToastViewport />
-      </div>
+          ) : (
+            <RouteErrorBoundary>
+              <Outlet />
+            </RouteErrorBoundary>
+          )}
+        </ApplicationShell>
+        <CommandPalette />
+        <NewIssueDialog />
+        <NewProjectDialog />
+        <NewGoalDialog />
+        <NewAgentDialog />
+        <KeyboardShortcutsCheatsheet open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+        <ToastViewport />
+      </>
     </GeneralSettingsProvider>
   );
 }
